@@ -3,50 +3,50 @@ package main
 import (
 	"crypto/tls"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/gorilla/mux"
 	gitlab "github.com/xanzy/go-gitlab"
-	// "gopkg.in/yaml.v2"
 )
 
-// const (
-// 	version        = "0.1"
-// 	defaultPort    = "8888"
-// 	defaultLogFile = "/var/log/mr.mirror.log"
-// 	usage          = `mr.mirror-gl mirror merge request for gitlab`
-// )
+const usage = `
+Usage: mr.mirror [OPTIONS] branch=downstream ...
 
-// var (
-// 	listen  string
-// 	logPath string
-// )
+A bot to cherry pick gitlab merge request to downstream branch
 
-// func init() {
-// 	flag.StringVar(&httpprof, "httpprof", "", "pprof listen at")
-// 	flag.StringVar(&listen, "listen", defaultListen, "listen at, default "+defaultListen)
-// 	flag.StringVar(&logFilePath, "logfile", defaultLogFile, "log to file")
+Options:
+	--listen		listen at, default :80
+	--gitlab-url		gitlab base url for gitlab api, E.g. "https://gitlab.com"
+	--gitlab-token		gitlab access token for gitlab api, create via GitLab > User Settings > Access Tokens
+	--logging-file		logging file, default /var/log/mr.mirror.log
+`
+
+var (
+	listen        string
+	loggingFile   string
+	gitlabBaseURL string
+	gitlabToken   string
+	mappings      map[string]string = make(map[string]string)
+	client        *gitlab.Client
+)
+
+// var mappings = map[string]string{
+// 	"Branch_v2.0": "MASTER",
+// 	"MASTER":      "Branch_v2.1.1",
 // }
 
-const (
-	gitlabBaesURL string = "https://118.190.200.88"
-	gitlabToken   string = "aeiQ5whk3jx8ySWm2Qys"
-	listenAddr    string = ":8888"
-)
-
-var client *gitlab.Client
-var mappings = map[string]string{
-	"Branch_v2.0": "MASTER",
-	"MASTER":      "Branch_v2.1.1",
-}
-
 func init() {
-	client = newGitLabClient(gitlabBaesURL, gitlabToken)
+	flag.StringVar(&listen, "listen", ":80", "listen at, default :80")
+	flag.StringVar(&loggingFile, "logging-file", "/var/log/mr.mirror.log", "logging file, default /var/log/mr.mirror.log")
+	flag.StringVar(&gitlabBaseURL, "gitlab-url", "", "gitlab base url for gitlab api, E.g. \"https://gitlab.com\"")
+	flag.StringVar(&gitlabToken, "gitlab-token", "", "gitlab access token for gitlab api, create via GitLab > User Settings > Access Tokens")
 }
 
 func newGitLabClient(baseURL, token string) *gitlab.Client {
@@ -66,10 +66,22 @@ func newGitLabClient(baseURL, token string) *gitlab.Client {
 }
 
 func main() {
-	// flag.Parse()
+	var help = flag.Bool("help", false, "show usage")
+	flag.Parse()
+	for _, str := range flag.Args() {
+		pair := strings.Split(str, "=")
+		if len(pair) == 2 {
+			mappings[pair[0]] = pair[1]
+		}
+	}
 
+	if *help || gitlabBaseURL == "" || gitlabToken == "" || len(mappings) == 0 {
+		fmt.Println(usage)
+		os.Exit(0)
+	}
+
+	client = newGitLabClient(gitlabBaseURL, gitlabToken)
 	r := mux.NewRouter()
-
 	r.HandleFunc("/mergerequests", func(w http.ResponseWriter, r *http.Request) {
 		var mr gitlab.MergeEvent
 		var err error
@@ -99,10 +111,11 @@ func main() {
 
 		if applied, failed, err := cherryPickMergeRequest(mr, workingBranch.Name); err != nil {
 			// create Issue
-			if _, err := createIssue(mr, pickIntoBranch, workingBranch.Name, applied, failed); err != nil {
+			log.Printf("cherry pick merge request[%d](%s) into %s failed: %v", mrIID, mr.ObjectAttributes.Title, pickIntoBranch, err)
+			if _, err := createIssue(mr, pickIntoBranch, workingBranch.Name, applied, failed, err); err != nil {
 				log.Printf("cherry pick merge request[%d](%s) into %s failed without issue: %v", mrIID, mr.ObjectAttributes.Title, pickIntoBranch, err)
 			} else {
-				log.Printf("issue created when cherry pick merge request[%d](%s) into %s failed", mrIID, mr.ObjectAttributes.Title, pickIntoBranch)
+				log.Printf("issue created for the failure")
 			}
 		} else {
 			// create MergeRequest
@@ -118,10 +131,11 @@ func main() {
 
 	srv := &http.Server{
 		Handler:      r,
-		Addr:         listenAddr,
+		Addr:         listen,
 		WriteTimeout: 15 * time.Second,
 		ReadTimeout:  15 * time.Second,
 	}
+	fmt.Println("start mr.mirror at ", listen)
 	log.Fatal(srv.ListenAndServe())
 }
 
@@ -197,7 +211,7 @@ func cherryPickCommits(projectID interface{}, commits []*gitlab.Commit, branch s
 	return len(commits), nil
 }
 
-func createIssue(mr gitlab.MergeEvent, pickInto, workingOn string, applied []*gitlab.Commit, failed []*gitlab.Commit) (*gitlab.Issue, error) {
+func createIssue(mr gitlab.MergeEvent, pickInto, workingOn string, applied []*gitlab.Commit, failed []*gitlab.Commit, err error) (*gitlab.Issue, error) {
 	title := fmt.Sprintf("Fail to cherry pick MR[%d](%s) into %s", mr.ObjectAttributes.IID, mr.ObjectAttributes.Title, pickInto)
 	var desc strings.Builder
 	desc.WriteString(fmt.Sprintf("**Merge Request:** %s\n\n", mr.ObjectAttributes.URL))
@@ -205,11 +219,11 @@ func createIssue(mr gitlab.MergeEvent, pickInto, workingOn string, applied []*gi
 	desc.WriteString(fmt.Sprintf("**Working Branch:** %s\n\n", workingOn))
 	desc.WriteString(fmt.Sprintf("**Details:** %d/%d commit(s) failed\n\n", len(failed), len(applied)+len(failed)))
 	for _, commit := range applied {
-		desc.WriteString(fmt.Sprintf("  *  %s applied\n", commit.ID))
+		desc.WriteString(fmt.Sprintf("  *  %s [applied]\n", commit.ID))
 	}
-	desc.WriteString(fmt.Sprintf("  * %s failed\n", failed[0].ID))
+	desc.WriteString(fmt.Sprintf("  * %s [failed]: %s\n", failed[0].ID, err.Error()))
 	for _, commit := range failed[1:] {
-		desc.WriteString(fmt.Sprintf("  * %s skipped\n", commit.ID))
+		desc.WriteString(fmt.Sprintf("  * %s [skipped]\n", commit.ID))
 	}
 	issue, _, err := client.Issues.CreateIssue(mr.ObjectAttributes.SourceProjectID, &gitlab.CreateIssueOptions{
 		Title:                              gitlab.String(title),
@@ -232,48 +246,3 @@ func createMergeRequest(event gitlab.MergeEvent, source, target string) (*gitlab
 	})
 	return mr, err
 }
-
-// yml
-// MASTER => Branch_v2.1.1
-// Branch_v2.0 => MASTER
-// branch name
-
-// projectID := mr.ObjectAttributes.SourceProjectID
-// // commits, _, err := client.MergeRequests.GetMergeRequestCommits(projectID, mr.ObjectAttributes.IID, &gitlab.GetMergeRequestCommitsOptions{})
-// // if err != nil {
-// // 	// log.Printf("fail to get mergerequest's commits: %v", err)
-// // 	// writeString(w, err.Error(), 500)
-// // 	// return
-// // 	log.Fatal(err)
-// // }
-
-// log.Printf("merge request %d (%s) has %d commit(s)", mr.ObjectAttributes.ID, mr.ObjectAttributes.Title, len(commits))
-
-// if err != nil {
-// 	log.Fatal(err)
-// }
-// log.Printf("branch %s created for cherry pick merge request %d (%s)'s commit(s)", branch.Name, mr.ObjectAttributes.ID, mr.ObjectAttributes.Title)
-
-// if i, err := cherryPickCommits(projectID, commits, branch.Name); err != nil {
-// 	client.MergeRequests.CreateMergeRequest(projectID, &gitlab.CreateMergeRequestOptions{
-// 		Title:              gitlab.String(fmt.Sprintf("MIRROR:%s", mr.ObjectAttributes.Title)),
-// 		Description:        gitlab.String(mr.ObjectAttributes.Description),
-// 		SourceBranch:       gitlab.String(branch.Name),
-// 		TargetBranch:       gitlab.String(applyToBranch),
-// 		AssigneeID:         gitlab.Int(mr.ObjectAttributes.AuthorID),
-// 		TargetProjectID:    gitlab.Int(mr.ObjectAttributes.TargetProjectID),
-// 		RemoveSourceBranch: gitlab.Bool(true),
-// 	})
-// } else {
-// 	issueTitle := "Fail to cherry pick %mergerequest into $branch"
-// 	issueDesc := "branch xxxx -> commitid1 succeed. commitid2 failed."
-// 	client.Issues.CreateIssue(projectID, &gitlab.CreateIssueOptions{
-// 		Title:                              gitlab.String(issueTitle),
-// 		Description:                        gitlab.String(issueDesc),
-// 		AssigneeIDs:                        []int{mr.ObjectAttributes.AuthorID},
-// 		MergeRequestToResolveDiscussionsOf: gitlab.Int(mr.ObjectAttributes.IID),
-// 	})
-// 	//TODO create ISSUE
-// 	//TODO revert picked commits if error , or delete branch ?
-// 	log.Printf("%d/%d commit(s) failed", i+1, len(commits))
-// }
